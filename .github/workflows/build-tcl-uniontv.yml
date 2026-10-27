@@ -1,0 +1,139 @@
+name: Build CleanYourTV - TCL UnionTV Android 9
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Download official CleanYourTV source (v3.1.0)
+        uses: actions/checkout@v4
+        with:
+          repository: Gathin23/cleanyourtv
+          ref: v3.1.0
+          path: source
+          persist-credentials: false
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK 34
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platforms;android-34 build-tools;34.0.0
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Reuse signing certificate for subsequent builds
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: tcl-uniontv-android9-debug-signing-v1
+
+      - name: Customize launcher for TCL UnionTV Android 9
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import xml.etree.ElementTree as ET
+
+          p = Path('source/launcher/app/src/main/res/values/config.xml')
+          s = p.read_text(encoding='utf-8')
+
+          # Exact packages from the owner's own TV package listing.
+          dock = [
+              'com.netflix.ninja',
+              'com.google.android.youtube.tv',
+              'in.startv.hotstar.dplus.tv',
+              'com.amazon.amazonvideo.livingroom',
+          ]
+
+          def replace_array(text, name, packages):
+              pattern = rf'(<string-array name="{re.escape(name)}">).*?(</string-array>)'
+              content = '\n' + ''.join(f'        <item>{x}</item>\n' for x in packages) + '    '
+              result, count = re.subn(pattern, lambda m: m.group(1) + content + m.group(2), text, count=1, flags=re.S)
+              if count != 1:
+                  raise RuntimeError(f'Unable to locate <string-array name="{name}"> in official config')
+              return result
+
+          s = replace_array(s, 'dock_apps', dock)
+          # Keep all stock app tiles except the duplicate Live TV tile: it remains in the Inputs menu.
+          hidden_match = re.search(r'<string-array name="hidden_apps">(.*?)</string-array>', s, re.S)
+          if not hidden_match:
+              raise RuntimeError('Unable to find hidden_apps')
+          hidden = re.findall(r'<item>([^<]+)</item>', hidden_match.group(1))
+          if 'com.tcl.tv' not in hidden:
+              hidden.append('com.tcl.tv')
+          s = replace_array(s, 'hidden_apps', hidden)
+
+          pattern = r'(<string name="live_tv_package" translatable="false">).*?(</string>)'
+          s, count = re.subn(pattern, r'\g<1>com.tcl.tv\g<2>', s, count=1, flags=re.S)
+          if count != 1:
+              raise RuntimeError('Unable to find live_tv_package')
+          ET.fromstring(s)
+          p.write_text(s, encoding='utf-8')
+          print('Configured dock:', ', '.join(dock))
+          print('Live TV app: com.tcl.tv; duplicated Live TV tile hidden')
+          PY
+
+      - name: Build signed release APK
+        working-directory: source/launcher
+        shell: bash
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace assembleRelease
+
+      - name: Verify Android compatibility and APK
+        shell: bash
+        run: |
+          APK=source/launcher/app/build/outputs/apk/release/app-release.apk
+          test -s "$APK"
+          "$ANDROID_HOME/build-tools/34.0.0/aapt" dump badging "$APK" | grep -E "^(package:|sdkVersion:|targetSdkVersion:)"
+          "$ANDROID_HOME/build-tools/34.0.0/aapt" dump badging "$APK" | grep -F "package: name='com.gathin.tvhome'"
+          "$ANDROID_HOME/build-tools/34.0.0/aapt" dump badging "$APK" | grep -F "sdkVersion:'26'"
+          cp "$APK" CleanYourTV-TCL-UnionTV-Android9.apk
+          sha256sum CleanYourTV-TCL-UnionTV-Android9.apk > SHA256.txt
+          cat > INSTALL-FIRST.txt <<'TXT'
+          CleanYourTV launcher 3.1 / TCL UnionTV / Android TV 9 (API 28)
+          Profile: TCL-AP-RT41DT-S1, firmware builder.20201203.103024
+          App package: com.gathin.tvhome
+          Dock: Netflix, YouTube, Disney+ Hotstar, Prime Video
+          Live TV: com.tcl.tv (available through Inputs)
+
+          Built from the official Gathin23/cleanyourtv v3.1.0 GitHub tag.
+          This is a compiled APK, not an Android firmware image.
+          Install the APK using an ADB client or the TV's file manager.
+          Do NOT disable the stock launcher before the new app has been installed,
+          started and tested successfully on the TV.
+          The workflow does not connect to your TV or change any TV settings.
+
+          AirHQ shell commands AFTER installation:
+            am start -W -n com.gathin.tvhome/.MainActivity
+            cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.HOME
+
+          The second command only inspects the current default Home application.
+          Keep both com.google.android.tvlauncher and com.google.android.leanbacklauncher
+          enabled until the replacement is fully working. Reverting to stock is
+          easier if you keep the original launchers enabled.
+          TXT
+
+      - name: Downloadable APK and install notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: CleanYourTV-TCL-UnionTV-Android9
+          path: |
+            CleanYourTV-TCL-UnionTV-Android9.apk
+            SHA256.txt
+            INSTALL-FIRST.txt
+          if-no-files-found: error
+          retention-days: 30
